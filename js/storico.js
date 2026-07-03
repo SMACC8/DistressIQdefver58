@@ -432,10 +432,16 @@ async function eliminaSelezionati() {
   RILIEVI.filter((r) => selezione.has(r.id)).forEach((r) => {
     if (r.foto_id) paths.push(r.foto_id);
     if (r.thumb_path) paths.push(r.thumb_path);
+    // foto aggiuntive (le righe rilievo_foto vanno via in cascata, ma i file no)
+    (r.rilievo_foto || []).forEach((f) => {
+      if (f.foto_id) paths.push(f.foto_id);
+      if (f.thumb_path) paths.push(f.thumb_path);
+    });
   });
+  const uniq = [...new Set(paths)];
   try {
     await db.rilievi.remove(ids);
-    for (const p of paths) { try { await storage.remove(p); } catch { /* best-effort */ } }
+    for (const p of uniq) { try { await storage.remove(p); } catch { /* best-effort */ } }
     await renderStorico(rootEl);
   } catch (e) {
     alert((t("sto_err_elim") + ": ") + ((e && e.message) || e));
@@ -453,10 +459,38 @@ function distM(a, b) {
   const x = Math.sin(dLat / 2) ** 2 + Math.cos(toR(a.gps_lat)) * Math.cos(toR(b.gps_lat)) * Math.sin(dLon / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(x));
 }
+// --- Criteri di collegamento evoluzione ---------------------------------
+// Regole (approvate): stessa strada/direzione, prossimità < 20 m,
+// corsia uguale O contigua (differenza di 1), date su giorni diversi.
+const RAGGIO_EVOL_M = 20;   // soglia prossimità (progressiva o GPS)
+
+// corsia è salvata come stringa multi-valore ("0", "1,2", …) oppure null/"".
+// Due rilievi sono compatibili se le corsie coincidono, sono contigue (Δ=1)
+// o si sovrappongono. Se manca la corsia da un lato, non blocca il match.
+function corsieVicine(a, b) {
+  const parse = (v) => (v == null || v === "")
+    ? []
+    : String(v).split(",").map((x) => parseInt(x, 10)).filter((n) => !isNaN(n));
+  const ca = parse(a.corsia), cb = parse(b.corsia);
+  if (!ca.length || !cb.length) return true; // corsia non specificata: non escludere
+  let min = Infinity;
+  ca.forEach((x) => cb.forEach((y) => { const d = Math.abs(x - y); if (d < min) min = d; }));
+  return min <= 1; // stessa (0) o contigua (1)
+}
+
+// giorni di calendario diversi: un rilievo dello stesso giorno è la stessa
+// campagna d'ispezione, non un'evoluzione nel tempo.
+function giorniDiversi(a, b) {
+  const da = new Date(a.created_at), db = new Date(b.created_at);
+  if (isNaN(da) || isNaN(db)) return true;
+  return da.toDateString() !== db.toDateString();
+}
+
 function stessoPunto(a, b) {
-  if (a.strada !== b.strada || a.direzione !== b.direzione || a.corsia !== b.corsia) return false;
-  if (a.progressiva_m != null && b.progressiva_m != null) return Math.abs(a.progressiva_m - b.progressiva_m) <= 30;
-  return distM(a, b) <= 30; // fallback GPS quando manca la progressiva
+  if (a.strada !== b.strada || a.direzione !== b.direzione) return false;
+  if (!corsieVicine(a, b)) return false; // corsia uguale o contigua
+  if (a.progressiva_m != null && b.progressiva_m != null) return Math.abs(a.progressiva_m - b.progressiva_m) <= RAGGIO_EVOL_M;
+  return distM(a, b) <= RAGGIO_EVOL_M; // fallback GPS quando manca la progressiva
 }
 function discendentiIds(r) {
   const set = new Set(), stack = [r.id];
@@ -478,7 +512,8 @@ function candidati(r) {
   const desc = discendentiIds(r);
   return RILIEVI.filter((c) =>
     c.id !== r.id && !desc.has(c.id) &&
-    new Date(c.created_at) < new Date(r.created_at) && stessoPunto(r, c)
+    new Date(c.created_at) < new Date(r.created_at) &&
+    giorniDiversi(r, c) && stessoPunto(r, c)
   ).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 }
 function evoluzioneHtml(r) {
@@ -515,6 +550,17 @@ function evoluzioneHtml(r) {
   return `<div class="m-field"><div class="k">${t("sto_evoluzione")}</div>${timeline}${somma}${azione}</div>`;
 }
 
+// galleria foto del rilievo: usa rilievo_foto (multi, ordinata) con fallback
+// alla foto singola foto_id per i rilievi antecedenti la migrazione.
+function galleriaFoto(r) {
+  let foto = Array.isArray(r.rilievo_foto) ? r.rilievo_foto.slice() : [];
+  foto.sort((a, b) => (a.ordine ?? 0) - (b.ordine ?? 0));
+  if (!foto.length && r.foto_id) foto = [{ foto_id: r.foto_id }];
+  if (!foto.length) return "";
+  const imgs = foto.map((f) => `<img class="foto-img sto-foto" src="${storage.url(f.foto_id)}" alt="">`).join("");
+  return `<div class="m-field"><div class="k">${t("ril_foto")}${foto.length > 1 ? ` (${foto.length})` : ""}</div><div class="sto-galleria">${imgs}</div></div>`;
+}
+
 function apriDettaglio(id) {
   const r = RILIEVI.find((x) => x.id === id);
   if (!r) return;
@@ -542,9 +588,10 @@ function apriDettaglio(id) {
         ${campo(t("sto_th_ubic"), ubicazione(r))}
         ${campo(t("sto_th_coord"), coord(r))}
         ${campo(t("sto_strato_lbl"), STRATO(r.strato) || r.strato || "—")}
-        ${r.foto_id ? `<div class="m-field"><div class="k">${t("ril_foto")}</div><img class="foto-img" src="${storage.url(r.foto_id)}" alt=""></div>` : ""}
+        ${galleriaFoto(r)}
         ${blocco("operatore", t("sto_th_dop"))}
         ${blocco("ai", t("sto_th_dai"))}
+        ${r.ai_descrizione ? `<div class="m-field"><div class="k">${t("ril_ai_diag")}</div><div class="v ai-diag-t">${String(r.ai_descrizione)}</div></div>` : ""}
         ${evoluzioneHtml(r)}
       </div>
     </div>`;

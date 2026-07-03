@@ -47,6 +47,22 @@ export const db = {
       if (error) throw error;
       return data;
     },
+    // conta quante volte un distress è referenziato (rilievi + esempi ML),
+    // per decidere se è eliminabile in sicurezza
+    contaUso: async (id) => {
+      const { count: cR, error: eR } = await supabase
+        .from("rilievo_distress").select("id", { count: "exact", head: true }).eq("distress_id", id);
+      if (eR) throw eR;
+      const { count: cM, error: eM } = await supabase
+        .from("ml_esempio").select("id", { count: "exact", head: true }).eq("distress_id", id);
+      if (eM) throw eM;
+      return (cR ?? 0) + (cM ?? 0);
+    },
+    // elimina definitivamente un distress (usare solo sui personalizzati non referenziati)
+    remove: async (id) => {
+      const { error } = await supabase.from("distress").delete().eq("id", id);
+      if (error) throw error;
+    },
   },
 
   rilievi: {
@@ -68,8 +84,8 @@ export const db = {
       if (error) throw error;
       return data;
     },
-    // inserisce il rilievo e i distress collegati (operatore/AI)
-    createConDistress: async (rilievo, distressList) => {
+    // inserisce il rilievo, i distress collegati (operatore/AI) e le foto (1..3)
+    createConDistress: async (rilievo, distressList, foto) => {
       const { data: r, error } = await supabase
         .from("rilievo").insert(rilievo).select().single();
       if (error) throw error;
@@ -77,6 +93,13 @@ export const db = {
         const rows = distressList.map((d) => ({ ...d, rilievo_id: r.id }));
         const { error: e2 } = await supabase.from("rilievo_distress").insert(rows);
         if (e2) throw e2;
+      }
+      if (foto && foto.length) {
+        const frows = foto.map((f, i) => ({
+          rilievo_id: r.id, foto_id: f.foto_id, thumb_path: f.thumb_path || null, ordine: i,
+        }));
+        const { error: e3 } = await supabase.from("rilievo_foto").insert(frows);
+        if (e3) throw e3;
       }
       return r;
     },
@@ -87,11 +110,11 @@ export const db = {
       if (error) throw error;
       return data;
     },
-    // tutti i rilievi con i distress annidati (e il catalogo), per lo Storico
+    // tutti i rilievi con i distress e le foto annidati (e il catalogo), per lo Storico
     listConDistress: async () => {
       const { data, error } = await supabase
         .from("rilievo")
-        .select("*, rilievo_distress(*, distress(codice, nome, unita_misura, deduct_params, ha_severita))")
+        .select("*, rilievo_distress(*, distress(codice, nome, unita_misura, deduct_params, ha_severita)), rilievo_foto(foto_id, thumb_path, ordine)")
         .order("created_at", { ascending: false });
       if (error) throw error;
       return data;

@@ -18,7 +18,7 @@ DistressIQ/
 │  ├─ config.js            # SUPABASE_URL / SUPABASE_KEY (pubblica) / BUCKET_FOTO
 │  ├─ db.js                # unico punto di contatto con Supabase (+ lingua verso l'AI)
 │  ├─ storage.js           # astrazione storage foto (oggi Supabase, domani Drive dietro la stessa interfaccia)
-│  ├─ rilievo.js           # Survey: foto → AI → validazione, GPS↔progressiva, corsie multiple, data/ora manuale
+│  ├─ rilievo.js           # Survey: foto multiple (max 3) → AI → validazione, GPS↔progressiva, corsie multiple, persistenza campi, data/ora manuale
 │  ├─ storico.js           # Storico: tabella, dettaglio, evoluzione, export CSV / KMZ / PDF
 │  ├─ statistiche.js       # dashboard: donut (fasce/gravità/origine) + barre, nessuna libreria
 │  ├─ iq.js                # calcolo IQ (deduct, fasce)

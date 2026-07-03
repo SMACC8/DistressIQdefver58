@@ -331,7 +331,10 @@ function apriDettaglio(id) {
         <div class="mono" style="font-size:12px;color:var(--muted)">${t("lbl_stato")}:
           <span style="color:${d.attivo ? "var(--accent)" : "#ff8a8a"}">${d.attivo ? t("stato_attivo") : t("stato_off")}</span>
         </div>
-        <button class="btn" id="d-toggle">${d.attivo ? t("tog_disattiva") : t("tog_attiva")}</button>
+        <div style="display:flex;gap:8px">
+          ${d.personalizzato ? `<button class="btn btn-danger" id="d-del">${t("cust_elimina")}</button>` : ""}
+          <button class="btn" id="d-toggle">${d.attivo ? t("tog_disattiva") : t("tog_attiva")}</button>
+        </div>
       </div>
     </div>`;
 
@@ -348,6 +351,25 @@ function apriDettaglio(id) {
       caricaCatalogo();
     } catch (e) {
       tog.disabled = false;
+      alert(`${t("nf_errore")}: ${(e && e.message) ? e.message : e}`);
+    }
+  });
+  const del = ov.querySelector("#d-del");
+  if (del) del.addEventListener("click", async () => {
+    del.disabled = true;
+    try {
+      const uso = await db.distress.contaUso(d.id);
+      if (uso > 0) {
+        alert(t("cust_in_uso").replace("{n}", uso));
+        del.disabled = false;
+        return;
+      }
+      if (!confirm(t("cust_conf_elim"))) { del.disabled = false; return; }
+      await db.distress.remove(d.id);
+      chiudi();
+      caricaCatalogo();
+    } catch (e) {
+      del.disabled = false;
       alert(`${t("nf_errore")}: ${(e && e.message) ? e.message : e}`);
     }
   });

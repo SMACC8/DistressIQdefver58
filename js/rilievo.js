@@ -61,6 +61,7 @@ const STRADA_DIR = (s) => ({
   A31: [["nord",t("dir_nord")],["sud",t("dir_sud")]],
 }[s] || []);
 const STRADA_CORSIE = { A4: [0,1,2,3], A31: [0,1,2] };
+const SOGLIA_FUORI_TRACCIATO_M = 90;   // oltre questo scostamento dall'asse → fuori tracciato
 const SEV = () => [["bassa",t("sev_bassa")],["media",t("sev_media")],["alta",t("sev_alta")]];
 const UNITA = { m: "m", m2: "m²", conteggio: "n°" };
 const STRATI = () => [
@@ -72,7 +73,14 @@ const STRATI = () => [
 
 let catalogo = [];   // distress attivi per il menù
 let lista = [];      // distress aggiunti a questo rilievo (in memoria)
-let fotoFile = null; // foto selezionata (File), elaborata al salvataggio
+let fotoFiles = []; // foto selezionate (File[], max 3), elaborate al salvataggio
+let ultimaDescrizioneAI = null; // descrizione testuale prodotta dall'AI, salvata in History
+const MAX_FOTO = 3;
+
+// Persistenza campi ad app aperta: mantiene l'ultima scelta dei campi di
+// ubicazione/pavimentazione quando si cambia pagina e si torna al Rilievo.
+// È volutamente in memoria (si azzera alla chiusura dell'app / reload).
+let statoForm = null;
 
 const opt = (v, l, sel = "") => `<option value="${v}" ${sel}>${l}</option>`;
 
@@ -160,7 +168,7 @@ async function raccogliEsempi(strato, max = 3) {
 }
 
 export async function renderRilievo(root) {
-  lista = []; fotoFile = null;
+  lista = []; fotoFiles = []; ultimaDescrizioneAI = null;
   root.innerHTML = markup();
   try { catalogo = ordina(await db.distress.list()); } catch { catalogo = []; }
   wire(root);
@@ -291,16 +299,65 @@ function wire(root) {
   }
   dtipo.addEventListener("change", syncUnit);
 
-  strada.addEventListener("change", () => {
-    const s = strada.value;
+  // ricostruisce opzioni direzione + checkbox corsia in base alla strada
+  function popolaDirCorsia(s) {
     dir.innerHTML = `<option value="">—</option>` + STRADA_DIR(s).map(([v,l])=>opt(v,l)).join("");
     corsia.innerHTML = s
       ? (STRADA_CORSIE[s]||[]).map((c)=>`<label class="chk"><input type="checkbox" value="${c}"> ${c}</label>`).join("")
       : `<span class="hint">${t("ril_corsia_hint")}</span>`;
     dir.disabled = !s;
+  }
+  strada.addEventListener("change", () => {
+    popolaDirCorsia(strada.value);
+    salvaStato();
   });
 
   prog.addEventListener("input", () => progFmt.textContent = fmtProg(prog.value));
+
+  // --- persistenza campi ad app aperta -------------------------------------
+  let ripristinando = false;   // evita che il ripristino ritrigghi salvaStato
+  function salvaStato() {
+    if (ripristinando) return;
+    statoForm = {
+      strada: strada.value,
+      direzione: dir.value,
+      corsia: corsieSelezionate(),          // "0,1" | "2" | null
+      prog: prog.value,
+      data: dataInput ? dataInput.value : "",
+      lat: lat.value,
+      lon: lon.value,
+      strato: strato.value,
+    };
+  }
+  function ripristinaStato() {
+    if (!statoForm) return;
+    ripristinando = true;
+    try {
+      strada.value = statoForm.strada || "";
+      popolaDirCorsia(strada.value);        // ricostruisce dir+corsia coerenti
+      if (statoForm.direzione) dir.value = statoForm.direzione;
+      if (statoForm.corsia) {
+        const sel = new Set(String(statoForm.corsia).split(","));
+        corsia.querySelectorAll('input[type="checkbox"]').forEach((cb) => { cb.checked = sel.has(cb.value); });
+      }
+      prog.value = statoForm.prog || "";
+      progFmt.textContent = prog.value !== "" ? fmtProg(prog.value) : "—";
+      if (dataInput && statoForm.data) dataInput.value = statoForm.data;
+      lat.value = statoForm.lat || "";
+      lon.value = statoForm.lon || "";
+      strato.value = statoForm.strato || "";
+    } finally {
+      ripristinando = false;
+    }
+  }
+  // aggancio il salvataggio ai campi che non hanno già un handler dedicato
+  dir.addEventListener("change", salvaStato);
+  corsia.addEventListener("change", salvaStato);   // delega: cattura i checkbox
+  strato.addEventListener("change", salvaStato);
+  prog.addEventListener("change", salvaStato);
+  lat.addEventListener("change", salvaStato);
+  lon.addEventListener("change", salvaStato);
+  if (dataInput) dataInput.addEventListener("change", salvaStato);
 
   let ultimoScostamento = null;
   async function calcolaProgressiva() {
@@ -308,25 +365,29 @@ function wire(root) {
     const s = strada.value;
     if (!s) { gpsMsg.textContent = t("ril_m_strada_prima"); return; }
     if (lat.value === "" || lon.value === "") { gpsMsg.textContent = t("ril_m_coord"); return; }
-    gpsMsg.textContent = t("ril_m_calc_prog");
+    gpsMsg.style.color = ""; gpsMsg.textContent = t("ril_m_calc_prog");
     try {
       const r = await gpsToProgressiva(s, Number(lat.value), Number(lon.value));
       if (!r) { gpsMsg.textContent = `${t("ril_etto_a")} ${s}${t("ril_etto_b")}`; return; }
       prog.value = r.progressiva_m; progFmt.textContent = fmtProg(r.progressiva_m);
       ultimoScostamento = r.scostamento_m;
-      gpsMsg.textContent = `${t("ril_prog_ok")} ${r.scostamento_m} m`;
+      const fuori = r.scostamento_m > SOGLIA_FUORI_TRACCIATO_M;
+      gpsMsg.textContent = `${t("ril_prog_ok")} ${r.scostamento_m} m` + (fuori ? ` · ${t("ril_fuori_tracciato")}` : "");
+      gpsMsg.style.color = fuori ? "#ff8a8a" : "";
+      salvaStato();
     } catch (e) { gpsMsg.textContent = (t("ril_errore") + ": ") + ((e && e.message) || e); }
   }
   async function calcolaCoordinate() {
     const s = strada.value;
     if (!s) { gpsMsg.textContent = t("ril_m_strada_prima"); return; }
     if (prog.value === "") { gpsMsg.textContent = t("ril_m_ins_prog"); return; }
-    gpsMsg.textContent = t("ril_m_calc_coord");
+    gpsMsg.style.color = ""; gpsMsg.textContent = t("ril_m_calc_coord");
     try {
       const r = await progressivaToGps(s, Number(prog.value));
       if (!r) { gpsMsg.textContent = `${t("ril_etto_a")} ${s}${t("ril_etto_b")}`; return; }
       lat.value = r.lat.toFixed(6); lon.value = r.lon.toFixed(6);
       gpsMsg.textContent = t("ril_m_coord_ok");
+      salvaStato();
     } catch (e) { gpsMsg.textContent = (t("ril_errore") + ": ") + ((e && e.message) || e); }
   }
   // conversione automatica: progressiva -> coordinate e coordinate -> progressiva
@@ -336,11 +397,12 @@ function wire(root) {
 
   gpsBtn.addEventListener("click", () => {
     if (!navigator.geolocation) { gpsMsg.textContent = t("ril_m_gps_nd"); return; }
-    gpsMsg.textContent = t("ril_m_lettura");
+    gpsMsg.style.color = ""; gpsMsg.textContent = t("ril_m_lettura");
     navigator.geolocation.getCurrentPosition(
       (p) => {
         lat.value = p.coords.latitude.toFixed(6); lon.value = p.coords.longitude.toFixed(6);
         gpsMsg.textContent = t("ril_m_pos_ok");
+        salvaStato();
         if (strada.value) calcolaProgressiva();   // GPS -> progressiva automatica
       },
       () => { gpsMsg.textContent = t("ril_m_gps_negato"); },
@@ -369,14 +431,31 @@ function wire(root) {
   }
   function showFotoPreview() {
     const prev = $("#r-foto-prev"), name = $("#r-foto-name");
-    aiBtn.disabled = !fotoFile;
-    if (!fotoFile) { prev.innerHTML = ""; name.textContent = ""; return; }
-    const url = URL.createObjectURL(fotoFile);
-    prev.innerHTML = `<div class="foto-stage" id="r-foto-stage"><img src="${url}" class="foto-img" alt="anteprima" /><div class="foto-markers" id="r-foto-markers"></div></div>
-      <button type="button" class="btn btn-ghost" id="r-foto-rm">${t("ril_m_rimuovi_foto")}</button>`;
-    name.textContent = fotoFile.name || "";
+    const camBtn = $("#r-foto-cam"), galBtn = $("#r-foto-gal");
+    aiBtn.disabled = fotoFiles.length === 0;
+    const pieno = fotoFiles.length >= MAX_FOTO;
+    if (camBtn) camBtn.disabled = pieno;
+    if (galBtn) galBtn.disabled = pieno;
+    if (!fotoFiles.length) { prev.innerHTML = ""; name.textContent = ""; return; }
+    name.textContent = `${fotoFiles.length}/${MAX_FOTO}`;
+
+    // foto principale (indice 0): stage con marker per l'ubicazione dei distress
+    const urlPrimo = URL.createObjectURL(fotoFiles[0]);
+    let html = `<div class="foto-stage" id="r-foto-stage"><img src="${urlPrimo}" class="foto-img" alt="anteprima" /><div class="foto-markers" id="r-foto-markers"></div>
+      <button type="button" class="foto-card-rm" data-idx="0" title="${t("ril_m_rimuovi_foto")}">×</button></div>`;
+    // foto aggiuntive (1..2): semplici miniature con rimozione
+    if (fotoFiles.length > 1) {
+      html += `<div class="foto-extra-row">` + fotoFiles.slice(1).map((f, k) => {
+        const idx = k + 1;
+        const u = URL.createObjectURL(f);
+        return `<div class="foto-card"><img src="${u}" alt="foto ${idx + 1}" /><button type="button" class="foto-card-rm" data-idx="${idx}" title="${t("ril_m_rimuovi_foto")}">×</button></div>`;
+      }).join("") + `</div>`;
+    }
+    prev.innerHTML = html;
+
     const stage = $("#r-foto-stage");
     stage.addEventListener("click", (ev) => {
+      if (ev.target.closest(".foto-card-rm")) return; // il click sul × non piazza marker
       if (ubicaPer == null || !lista[ubicaPer]) return;
       const r = stage.getBoundingClientRect();
       const x = (ev.clientX - r.left) / r.width, y = (ev.clientY - r.top) / r.height;
@@ -385,14 +464,30 @@ function wire(root) {
       ubicaPer = null; stage.classList.remove("placing"); msg.textContent = "";
       disegnaMarkers(); renderChips();
     });
-    prev.querySelector("#r-foto-rm").addEventListener("click", () => {
-      fotoFile = null; foto.value = ""; aiMsg.textContent = ""; aiDiag.hidden = true; aiDiag.innerHTML = ""; ubicaPer = null;
-      lista.forEach((x) => { delete x.posizione; }); // le posizioni erano riferite alla foto rimossa
-      showFotoPreview(); renderChips();
-    });
+    // rimozione di una singola foto (per indice)
+    prev.querySelectorAll(".foto-card-rm").forEach((b) => b.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      const idx = Number(b.dataset.idx);
+      const eraPrimo = idx === 0;
+      fotoFiles.splice(idx, 1);
+      aiMsg.textContent = ""; aiDiag.hidden = true; aiDiag.innerHTML = ""; ultimaDescrizioneAI = null;
+      if (eraPrimo) {
+        // le posizioni dei marker erano riferite alla foto principale rimossa
+        ubicaPer = null;
+        lista.forEach((x) => { delete x.posizione; });
+        renderChips();
+      }
+      showFotoPreview();
+    }));
     disegnaMarkers();
   }
-  foto.addEventListener("change", () => { fotoFile = foto.files[0] || null; aiMsg.textContent = ""; aiDiag.hidden = true; aiDiag.innerHTML = ""; showFotoPreview(); });
+  foto.addEventListener("change", () => {
+    const f = foto.files[0];
+    if (f && fotoFiles.length < MAX_FOTO) fotoFiles.push(f);
+    foto.value = "";
+    aiMsg.textContent = ""; aiDiag.hidden = true; aiDiag.innerHTML = "";
+    showFotoPreview();
+  });
 
   function applicaAI(res) {
     if (res.strato && ["drenante_nuovo","drenante_maturo","non_drenante","non_determinabile"].includes(res.strato)) {
@@ -429,31 +524,39 @@ function wire(root) {
   }
 
   aiBtn.addEventListener("click", async () => {
-    if (!fotoFile) return;
+    if (!fotoFiles.length) return;
     aiBtn.disabled = true; aiMsg.style.color = "var(--muted)"; aiMsg.textContent = t("ril_m_ric_corso");
     try {
-      const blob = await ridimensiona(fotoFile, 1024, 0.8);
-      const image = await blobToBase64(blob);
+      // tutte le foto vengono ridimensionate e inviate insieme all'AI
+      const images = [];
+      for (const f of fotoFiles) {
+        const blob = await ridimensiona(f, 1024, 0.8);
+        images.push(await blobToBase64(blob));
+      }
       const esempi = await raccogliEsempi(strato.value || null);
       const res = await riconosciDistress({
-        image, mimeType: "image/jpeg",
+        images,                 // nuovo: array di immagini (1..3)
+        image: images[0],       // retro-compatibilità con edge function a foto singola
+        mimeType: "image/jpeg",
         strato: strato.value || null,
         catalogo: catalogo.map((d) => ({ codice: d.codice, nome: tx(d.nome) || "" })),
         esempi,
       });
       if (res && res.error) throw new Error(res.error);
       const n = applicaAI(res || {});
-      if (res && res.descrizione) {
+      ultimaDescrizioneAI = (res && res.descrizione) ? String(res.descrizione) : null;
+      if (ultimaDescrizioneAI) {
         aiDiag.hidden = false;
-        aiDiag.innerHTML = `<div class="ai-diag-h">${t("ril_ai_diag")}</div><div class="ai-diag-t">${String(res.descrizione)}</div>`;
+        aiDiag.innerHTML = `<div class="ai-diag-h">${t("ril_ai_diag")}</div><div class="ai-diag-t">${ultimaDescrizioneAI}</div>`;
       }
+      const nf = fotoFiles.length > 1 ? ` · ${fotoFiles.length} ${t("ril_foto")}` : "";
       const rif = esempi.length ? ` · ${esempi.length} ${t("ril_esempi")}` : "";
       const mod = res && res._modello ? ` · ${res._modello}` : "";
-      aiMsg.style.color = "var(--ok)"; aiMsg.textContent = `${t("ril_ric_ok")} · ${n} ${t("ril_aggiunti")}${rif}${mod}`;
+      aiMsg.style.color = "var(--ok)"; aiMsg.textContent = `${t("ril_ric_ok")} · ${n} ${t("ril_aggiunti")}${nf}${rif}${mod}`;
     } catch (e) {
       aiMsg.style.color = "#ff8a8a"; aiMsg.textContent = (t("ril_errore_ai") + ": ") + ((e && e.message) || e);
     } finally {
-      aiBtn.disabled = !fotoFile;
+      aiBtn.disabled = fotoFiles.length === 0;
     }
   });
 
@@ -468,7 +571,7 @@ function wire(root) {
       b.addEventListener("click", () => { lista.splice(Number(b.dataset.i),1); renderChips(); }));
     dlist.querySelectorAll(".chip-loc").forEach((b) =>
       b.addEventListener("click", () => {
-        if (!fotoFile) { msg.style.color = "#ff8a8a"; msg.textContent = t("ril_m_ubica_prima"); return; }
+        if (!fotoFiles[0]) { msg.style.color = "#ff8a8a"; msg.textContent = t("ril_m_ubica_prima"); return; }
         ubicaPer = Number(b.dataset.i);
         const stage = $("#r-foto-stage"); if (stage) stage.classList.add("placing");
         msg.style.color = "var(--muted)"; msg.textContent = t("ril_m_tocca");
@@ -524,20 +627,26 @@ function wire(root) {
     rilievo.iq = ris.iq;
     rilievo.iq_fascia = ris.fascia;
     try {
-      if (fotoFile) {
+      const fotoRecords = [];
+      if (fotoFiles.length) {
         msg.textContent = t("ril_m_elab_foto");
-        const full = await ridimensiona(fotoFile, 1600, 0.8);
-        const thumb = await ridimensiona(fotoFile, 320, 0.7);
-        const base = (crypto.randomUUID ? crypto.randomUUID() : "f" + Date.now());
-        msg.textContent = t("ril_m_caric_foto");
-        await storage.put(full, `${base}.jpg`);
-        await storage.put(thumb, `${base}_thumb.jpg`);
-        rilievo.foto_id = `${base}.jpg`;
-        rilievo.thumb_path = `${base}_thumb.jpg`;
+        for (let i = 0; i < fotoFiles.length; i++) {
+          const full = await ridimensiona(fotoFiles[i], 1600, 0.8);
+          const thumb = await ridimensiona(fotoFiles[i], 320, 0.7);
+          const base = (crypto.randomUUID ? crypto.randomUUID() : "f" + Date.now() + "_" + i);
+          msg.textContent = `${t("ril_m_caric_foto")} (${i + 1}/${fotoFiles.length})`;
+          await storage.put(full, `${base}.jpg`);
+          await storage.put(thumb, `${base}_thumb.jpg`);
+          fotoRecords.push({ foto_id: `${base}.jpg`, thumb_path: `${base}_thumb.jpg` });
+        }
+        // foto principale (indice 0) anche sul rilievo, per Storico/KMZ/PDF/CSV
+        rilievo.foto_id = fotoRecords[0].foto_id;
+        rilievo.thumb_path = fotoRecords[0].thumb_path;
         msg.textContent = t("nf_salvataggio");
       }
+      if (ultimaDescrizioneAI) rilievo.ai_descrizione = ultimaDescrizioneAI;
       const salvati = lista.slice();   // snapshot prima del reset
-      const r = await db.rilievi.createConDistress(rilievo, rows);
+      const r = await db.rilievi.createConDistress(rilievo, rows, fotoRecords);
       msg.style.color = "var(--ok)";
       msg.textContent = `✓ ${t("ril_salv_ok")} (id ${String(r.id).slice(0,8)}…) · ${rows.length} distress.`;
 
@@ -557,8 +666,9 @@ function wire(root) {
       savedBox.hidden = false;
       // reset leggero (lascio strada/direzione/corsia/strato per rilievi consecutivi)
       lista = []; renderChips();
-      fotoFile = null; foto.value = ""; aiMsg.textContent = ""; showFotoPreview();
+      fotoFiles = []; ultimaDescrizioneAI = null; foto.value = ""; aiMsg.textContent = ""; showFotoPreview();
       prog.value=""; progFmt.textContent="—"; lat.value=""; lon.value=""; gpsMsg.textContent=""; dest.value="";
+      salvaStato();   // aggiorna lo stato persistito (prog/lat/lon svuotati, ubicazione mantenuta)
     } catch (e) {
       msg.style.color = "#ff8a8a";
       msg.textContent = (t("nf_errore") + ": ") + ((e && e.message) ? e.message : e);
@@ -575,9 +685,13 @@ function wire(root) {
     dest.value=""; dtipo.value=""; dsev.value=""; dsev.disabled=false; dunit.textContent="—";
     ultimoScostamento=null;
     lista=[]; renderChips();
-    fotoFile=null; foto.value=""; aiMsg.textContent=""; aiDiag.hidden=true; aiDiag.innerHTML=""; aiBtn.disabled=true; showFotoPreview();
+    fotoFiles=[]; ultimaDescrizioneAI=null; foto.value=""; aiMsg.textContent=""; aiDiag.hidden=true; aiDiag.innerHTML=""; aiBtn.disabled=true; showFotoPreview();
     if (dataInput) dataInput.value = oraLocaleISO();
     msg.textContent=""; msg.style.color="var(--muted)"; savedBox.hidden=true; savedBox.innerHTML="";
+    statoForm = null;   // "Nuovo" è un reset esplicito: dimentica l'ultima scelta
   }
   if (nuovoBtn) nuovoBtn.addEventListener("click", nuovoRilievo);
+
+  // ripristina l'ultima scelta dei campi se si torna al Rilievo ad app aperta
+  ripristinaStato();
 }
